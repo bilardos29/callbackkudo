@@ -7,6 +7,7 @@ import uuid
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 import requests
+from mangum import Mangum
 
 app = FastAPI(title="DOKU VA Top-up & Callback")
 
@@ -358,6 +359,8 @@ def list_all_va():
 def health_check():
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
+# Handler wajib untuk Vercel serverless
+handler = Mangum(app)
 
 if __name__ == "__main__":
     import uvicorn
