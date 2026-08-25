@@ -4,10 +4,8 @@ import hashlib
 import hmac
 import json
 import uuid
-from fastapi import FastAPI, Header, HTTPException, Request
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
 import requests
-from mangum import Mangum
 
 app = FastAPI(title="DOKU VA Top-up & Callback")
 
@@ -16,8 +14,8 @@ DOKU_CLIENT_ID = "BRN-0230-1787648365302"
 DOKU_SECRET_KEY = "SK-4bNXUPeLYtiIDoVFrcPT"
 DOKU_BASE_URL = "https://api-sandbox.doku.com"
 
-# --- STORAGE SEMENTARA (untuk production, gunakan database) ---
-va_storage = {}  # Format: {va_number: {invoice_number, amount, order_id, created_at, status}}
+# In-memory storage (Hanya untuk local/single-process debugging)
+va_storage = {}
 
 
 # ==========================================
@@ -37,7 +35,7 @@ def generate_signature(
     target_path: str,
     digest: str = None,
 ) -> str:
-    """Membuat HMAC-SHA256 Signature sesuai spesifikasi DOKU."""
+    """Membuat HMAC-SHA256 Signature sesuai spesifikasi Jokul/DOKU."""
     component = (
         f"Client-Id:{client_id}\n"
         f"Request-Id:{request_id}\n"
@@ -64,7 +62,6 @@ def verify_signature(
     provided_signature: str,
     digest: str = None,
 ) -> bool:
-    """Verifikasi signature dari request DOKU callback."""
     expected_signature = generate_signature(
         client_id, secret_key, request_id, timestamp, target_path, digest
     )
@@ -72,13 +69,10 @@ def verify_signature(
 
 
 # ==========================================
-# 1. API UNTUK GENERATE VIRTUAL ACCOUNT
+# 1. API CREATE VIRTUAL ACCOUNT
 # ==========================================
 @app.post("/api/topup/create-va")
 def create_virtual_account(amount: int, order_id: str = None):
-    """
-    Create Virtual Account untuk topup.
-    """
     if not order_id:
         order_id = f"TOPUP-{uuid.uuid4().hex[:8].upper()}"
 
@@ -124,97 +118,66 @@ def create_virtual_account(amount: int, order_id: str = None):
         "Digest": digest,
     }
 
-    print("\n" + "=" * 60)
-    print(">>> [CREATE VA REQUEST KE DOKU] <<<")
-    print(f"Order ID: {order_id}")
-    print(f"Amount: Rp{amount}")
-    print(f"Request URL: {request_url}")
-    print("=" * 60 + "\n")
-
     response = requests.post(request_url, headers=headers, data=body_str)
 
     if response.status_code in [200, 201]:
         result = response.json()
-        
         va_number = result.get("virtual_account_info", {}).get("virtual_account_number")
         if va_number:
             va_storage[va_number] = {
                 "invoice_number": order_id,
                 "amount": amount,
-                "order_id": order_id,
-                "created_at": datetime.now(timezone.utc).isoformat(),
                 "status": "PENDING",
-                "va_number": va_number,
             }
-            print(f"✅ VA berhasil dibuat dan disimpan: {va_number}")
-        
         return result
     else:
-        print(f"❌ Error: {response.status_code} - {response.text}")
-        raise HTTPException(
-            status_code=response.status_code, detail=response.text
-        )
+        raise HTTPException(status_code=response.status_code, detail=response.text)
 
 
 # ==========================================
-# 2. API CALLBACK LENGKAP (INQUIRY + PAYMENT) - FIXED VERSION
+# 2. API CALLBACK UNIFIED (INQUIRY & PAYMENT)
 # ==========================================
 @app.post("/api/doku/callback")
-async def doku_callback(
-    request: Request,
-    client_id: str = Header(None),
-    request_id: str = Header(None),
-    request_timestamp: str = Header(None),
-    signature: str = Header(None),
-    digest: str = Header(None),
-):
-    """
-    Endpoint unified untuk INQUIRY REQUEST dan PAYMENT NOTIFICATION.
-    
-    ⚠️ PENTING: Pastikan header names di DOKU dashboard sesuai (case-sensitive).
-    Gunakan: Client-Id, Request-Id, Request-Timestamp, Signature, Digest
-    """
+async def doku_callback(request: Request):
+    # Ambil headers secara case-insensitive
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    client_id = headers.get("client-id")
+    request_id = headers.get("request-id")
+    request_timestamp = headers.get("request-timestamp")
+    signature = headers.get("signature")
+    digest = headers.get("digest")
+
     body_raw = await request.body()
     body_str = body_raw.decode("utf-8") if body_raw else "{}"
 
-    # Debug: Print all headers yang masuk
-    print("\n" + "=" * 70)
-    print(">>> [DOKU CALLBACK MASUK - DETAILED DEBUG] <<<")
-    print(f"All Headers: {dict(request.headers)}")
+    print("\n" + "=" * 60)
+    print(">>> [DOKU CALLBACK MASUK] <<<")
+    print(f"Path: {request.url.path}")
     print(f"Client-Id: {client_id}")
     print(f"Request-Id: {request_id}")
-    print(f"Request-Timestamp: {request_timestamp}")
+    print(f"Timestamp: {request_timestamp}")
     print(f"Signature: {signature}")
-    print(f"Digest (header): {digest}")
-    print(f"Body: {body_str[:300]}")
-    print("=" * 70 + "\n")
+    print(f"Digest: {digest}")
+    print(f"Body: {body_str}")
+    print("=" * 60 + "\n")
 
-    # ⚠️ VALIDASI: Semua header HARUS ada
     if not all([client_id, request_id, request_timestamp, signature, digest]):
-        print("❌ ERROR: Missing required headers!")
-        print(f"   client_id={client_id}, request_id={request_id}, ")
-        print(f"   timestamp={request_timestamp}, signature={signature}, digest={digest}")
+        print("❌ Error: Missing required headers")
         raise HTTPException(status_code=400, detail="Missing required headers")
 
-    # Parse request body
     try:
         data = json.loads(body_str)
     except Exception as e:
-        print(f"❌ Error parsing JSON: {e}")
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
 
-    # ✅ STEP 1: Verify digest dari body yang diterima
+    # 1. Validasi Digest
     calculated_digest = generate_digest(body_str)
     if digest != calculated_digest:
-        print(f"❌ DIGEST MISMATCH!")
-        print(f"   Received: {digest}")
-        print(f"   Calculated: {calculated_digest}")
-        raise HTTPException(status_code=401, detail="Digest verification failed")
-    else:
-        print(f"✅ Digest verified OK")
+        print(f"❌ Digest Mismatch! Got: {digest}, Expected: {calculated_digest}")
+        raise HTTPException(status_code=401, detail="Digest mismatch")
 
-    # ✅ STEP 2: Verify signature
-    target_path = "/api/doku/callback"
+    # 2. Validasi Signature
+    target_path = request.url.path  # Menggunakan path dinamis (/api/doku/callback)
     if not verify_signature(
         client_id,
         DOKU_SECRET_KEY,
@@ -224,43 +187,28 @@ async def doku_callback(
         signature,
         digest,
     ):
-        print(f"❌ SIGNATURE VERIFICATION FAILED!")
-        print(f"   Provided: {signature}")
-        expected_sig = generate_signature(
-            client_id, DOKU_SECRET_KEY, request_id, request_timestamp, target_path, digest
-        )
-        print(f"   Expected: {expected_sig}")
-        raise HTTPException(status_code=401, detail="Signature verification failed")
-    else:
-        print(f"✅ Signature verified OK")
+        print("❌ Signature Mismatch!")
+        raise HTTPException(status_code=401, detail="Invalid signature")
 
-    # Extract data dari request
+    # 3. Parsing Data
     order_info = data.get("order", {})
     invoice_number = order_info.get("invoice_number", "")
-    amount = order_info.get("amount")
-    
+    amount = order_info.get("amount", 0)
+
     va_info = data.get("virtual_account_info", {})
     va_number = va_info.get("virtual_account_number", "")
-    
+
     inquiry_info = data.get("virtual_account_inquiry")
     transaction_info = data.get("transaction", {})
     trx_status = transaction_info.get("status")
 
-    # ==========================================
-    # CASE 1: INQUIRY REQUEST (dari bank/acquirer)
-    # ==========================================
+    # CASE 1: INQUIRY REQUEST
     if inquiry_info and not trx_status:
-        print(f"📋 [INQUIRY REQUEST] VA: {va_number}")
-        print(f"   Invoice: {invoice_number}")
-        
-        va_data = va_storage.get(va_number, {})
-        stored_invoice = va_data.get("invoice_number", invoice_number)
-        stored_amount = va_data.get("amount", amount)
-        
-        inquiry_response = {
+        print(f"📋 [INQUIRY] VA: {va_number}, Invoice: {invoice_number}")
+        return {
             "order": {
-                "invoice_number": stored_invoice,
-                "amount": stored_amount,
+                "invoice_number": invoice_number,
+                "amount": amount,
             },
             "virtual_account_info": {
                 "virtual_account_number": va_number,
@@ -270,98 +218,24 @@ async def doku_callback(
             "virtual_account_inquiry": {
                 "status": "success",
             },
-            "customer": {
-                "name": "User Topup",
-                "email": "user@example.com",
-            },
         }
-        
-        print(f"✅ Inquiry SUCCESS response dikirim")
-        return inquiry_response
 
-    # ==========================================
-    # CASE 2: PAYMENT NOTIFICATION (notifikasi pembayaran)
-    # ==========================================
+    # CASE 2: PAYMENT NOTIFICATION
     elif trx_status:
-        print(f"💳 [PAYMENT NOTIFICATION] Status: {trx_status}")
-        print(f"   Invoice: {invoice_number}")
-        print(f"   Amount: Rp{amount}")
-        print(f"   VA: {va_number}")
-        
-        if va_number in va_storage:
-            va_storage[va_number]["status"] = trx_status
-            print(f"   ✅ Status updated: {trx_status}")
-        
-        if trx_status == "SUCCESS":
-            print(f"   🎉 TOPUP BERHASIL! Rp{amount} untuk Invoice: {invoice_number}")
-            # TODO: Update user balance, send email, log transaction
-        
-        elif trx_status == "FAILED":
-            print(f"   ❌ TOPUP GAGAL untuk Invoice: {invoice_number}")
-        
-        payment_response = {
+        print(f"💳 [PAYMENT SUCCESS] VA: {va_number}, Status: {trx_status}, Amount: {amount}")
+        return {
             "order": {
                 "invoice_number": invoice_number,
                 "amount": amount,
             },
             "virtual_account_info": {
                 "virtual_account_number": va_number,
-                "info1": "Topup Balance",
             },
         }
-        
-        return payment_response
 
-    # ==========================================
-    # CASE 3: UNKNOWN REQUEST
-    # ==========================================
-    else:
-        print(f"⚠️  Unknown request type")
-        raise HTTPException(status_code=400, detail="Unknown request type")
+    return {"status": "OK"}
 
 
-# ==========================================
-# 3. API UNTUK STATUS CHECK
-# ==========================================
-@app.get("/api/topup/status/{va_number}")
-def get_va_status(va_number: str):
-    """Get status VA dari storage."""
-    va_data = va_storage.get(va_number)
-    
-    if not va_data:
-        raise HTTPException(status_code=404, detail="VA not found")
-    
-    return {
-        "va_number": va_number,
-        "invoice_number": va_data.get("invoice_number"),
-        "amount": va_data.get("amount"),
-        "status": va_data.get("status"),
-        "created_at": va_data.get("created_at"),
-    }
-
-
-# ==========================================
-# 4. API LIST SEMUA VA
-# ==========================================
-@app.get("/api/topup/list")
-def list_all_va():
-    """List semua VA yang pernah dibuat (development only)."""
-    return {
-        "total": len(va_storage),
-        "vas": va_storage,
-    }
-
-
-# ==========================================
-# 5. HEALTH CHECK
-# ==========================================
 @app.get("/health")
-def health_check():
-    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
-
-# Handler wajib untuk Vercel serverless
-handler = Mangum(app)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+def health():
+    return {"status": "ok"}
