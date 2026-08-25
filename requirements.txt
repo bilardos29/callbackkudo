@@ -6,3 +6,4 @@ psycopg2-binary==2.9.9
 cryptography==42.0.7
 base58
 requests==2.32.5
+mangum
