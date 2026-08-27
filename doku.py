@@ -740,6 +740,9 @@ async def doku_callback(
     print(f"Signature: {signature}")
     print(f"Digest: {digest}")
     print(f"Body: {body_str}")
+    print("ALL HEADERS:")
+    for key, value in request.headers.items():
+        print(f"  {key}: {value}")
     print("=" * 60 + "\n")
 
     if not all([
