@@ -692,36 +692,18 @@ def create_virtual_account(
 # ============================================================
 # DOKU CALLBACK / NOTIFICATION
 # ============================================================
-
 @app.post("/api/doku/callback")
-async def doku_callback(
-    request: Request,
-):
+async def doku_callback(request: Request):
 
     headers = {
         key.lower(): value
         for key, value in request.headers.items()
     }
 
-    client_id = headers.get(
-        "client-id"
-    )
-
-    request_id = headers.get(
-        "request-id"
-    )
-
-    request_timestamp = headers.get(
-        "request-timestamp"
-    )
-
-    signature = headers.get(
-        "signature"
-    )
-
-    digest = headers.get(
-        "digest"
-    )
+    client_id = headers.get("client-id")
+    request_id = headers.get("request-id")
+    request_timestamp = headers.get("request-timestamp")
+    signature = headers.get("signature")
 
     body_raw = await request.body()
 
@@ -733,108 +715,94 @@ async def doku_callback(
 
     print("\n" + "=" * 60)
     print(">>> [DOKU CALLBACK MASUK] <<<")
-    print(f"Path: {request.url.path}")
     print(f"Client-Id: {client_id}")
     print(f"Request-Id: {request_id}")
     print(f"Timestamp: {request_timestamp}")
     print(f"Signature: {signature}")
-    print(f"Digest: {digest}")
     print(f"Body: {body_str}")
-    print("ALL HEADERS:")
-    for key, value in request.headers.items():
-        print(f"  {key}: {value}")
-    print("=" * 60 + "\n")
+    print("=" * 60)
+
+    # ========================================================
+    # REQUIRED HEADERS
+    # ========================================================
 
     if not all([
         client_id,
         request_id,
         request_timestamp,
         signature,
-        digest,
     ]):
-
-        print(
-            "❌ Missing required headers"
-        )
+        print("❌ Missing required headers")
 
         raise HTTPException(
             status_code=400,
             detail="Missing required headers",
         )
 
-    try:
+    # ========================================================
+    # CLIENT ID VALIDATION
+    # ========================================================
 
-        data = json.loads(
-            body_str
-        )
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Invalid JSON: {str(e)}"
-            ),
-        )
-
-    # --------------------------------------------------------
-    # VALIDATE DIGEST
-    # --------------------------------------------------------
-
-    calculated_digest = (
-        generate_digest(body_str)
-    )
-
-    if digest != calculated_digest:
-
-        print(
-            "❌ Digest Mismatch!"
-        )
+    if client_id != DOKU_CLIENT_ID:
+        print("❌ Invalid Client-Id")
 
         raise HTTPException(
             status_code=401,
-            detail="Digest mismatch",
+            detail="Invalid Client-Id",
         )
 
-    # --------------------------------------------------------
-    # VALIDATE SIGNATURE
-    # --------------------------------------------------------
+    # ========================================================
+    # CALCULATE DIGEST FROM RAW BODY
+    # ========================================================
+
+    calculated_digest = generate_digest(body_str)
+
+    print(f"Calculated Digest: {calculated_digest}")
+
+    # ========================================================
+    # VERIFY DOKU SIGNATURE
+    # ========================================================
 
     target_path = request.url.path
 
-    if not verify_signature(
+    is_valid = verify_signature(
         client_id,
         DOKU_SECRET_KEY,
         request_id,
         request_timestamp,
         target_path,
         signature,
-        digest,
-    ):
+        calculated_digest,
+    )
 
-        print(
-            "❌ Signature Mismatch!"
-        )
+    if not is_valid:
+        print("❌ Signature Mismatch!")
 
         raise HTTPException(
             status_code=401,
             detail="Invalid signature",
         )
 
-    # --------------------------------------------------------
-    # PARSE DATA
-    # --------------------------------------------------------
+    print("✅ DOKU Signature VALID")
 
-    order_info = data.get(
-        "order",
-        {},
-    )
+    # ========================================================
+    # PARSE BODY
+    # ========================================================
 
-    invoice_number = (
-        order_info.get(
-            "invoice_number",
-            "",
+    try:
+        data = json.loads(body_str)
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid JSON: {str(e)}",
         )
+
+    order_info = data.get("order", {})
+
+    invoice_number = order_info.get(
+        "invoice_number",
+        "",
     )
 
     amount = order_info.get(
@@ -847,15 +815,9 @@ async def doku_callback(
         {},
     )
 
-    va_number = (
-        va_info.get(
-            "virtual_account_number",
-            "",
-        )
-    )
-
-    inquiry_info = data.get(
-        "virtual_account_inquiry"
+    va_number = va_info.get(
+        "virtual_account_number",
+        "",
     )
 
     transaction_info = data.get(
@@ -864,48 +826,28 @@ async def doku_callback(
     )
 
     trx_status = transaction_info.get(
-        "status"
+        "status",
     )
 
-    # --------------------------------------------------------
-    # INQUIRY
-    # --------------------------------------------------------
-
-    if inquiry_info and not trx_status:
-
-        print(
-            f"📋 [INQUIRY] "
-            f"VA: {va_number}, "
-            f"Invoice: {invoice_number}"
-        )
-
-        return {
-            "order": {
-                "invoice_number": invoice_number,
-                "amount": amount,
-            },
-            "virtual_account_info": {
-                "virtual_account_number": va_number,
-                "billing_type": "FIXED_BILL",
-                "info1": "Topup Balance",
-            },
-            "virtual_account_inquiry": {
-                "status": "success",
-            },
-        }
-
-    # --------------------------------------------------------
-    # PAYMENT
-    # --------------------------------------------------------
+    # ========================================================
+    # PAYMENT NOTIFICATION
+    # ========================================================
 
     if trx_status:
 
         print(
-            f"💳 [PAYMENT] "
-            f"VA: {va_number}, "
-            f"Status: {trx_status}, "
-            f"Amount: {amount}"
+            f"💳 PAYMENT "
+            f"Invoice={invoice_number} "
+            f"VA={va_number} "
+            f"Status={trx_status} "
+            f"Amount={amount}"
         )
+
+        if trx_status == "SUCCESS":
+            print("✅ PAYMENT SUCCESS")
+
+            # TODO:
+            # update DB / top-up balance di sini
 
         return {
             "order": {
